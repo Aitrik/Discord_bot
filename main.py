@@ -6,13 +6,11 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import time
 from datetime import datetime
-from keep_alive import keep_alive
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-keep_alive()
 
 # Gemini client (lazy init)
 gemini_client = None
