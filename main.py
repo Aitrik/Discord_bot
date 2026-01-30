@@ -6,14 +6,124 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import time
 from datetime import datetime
+import pandas as pd
+import requests
+import io
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH")
+ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", 0))
+EXCEL_CHECK_INTERVAL = int(os.getenv("EXCEL_CHECK_INTERVAL", 30))
+
+last_row_count = 0
+monitor_started = False
+
+def fetch_sheet_data():
+    if not EXCEL_FILE_PATH:
+        return None
+
+    path = EXCEL_FILE_PATH.strip()
+    
+    # Handle Google Sheets URL
+    if "docs.google.com/spreadsheets" in path:
+        base_url = path.split("/edit")[0].split("/view")[0]
+        xlsx_url = f"{base_url}/export?format=xlsx"
+        
+        try:
+            response = requests.get(xlsx_url)
+            response.raise_for_status()
+            
+            # Read all sheets
+            excel_data = pd.read_excel(io.BytesIO(response.content), sheet_name=None)
+            
+            # Priority 1: Look for 'Sales' sheet as seen in screenshot
+            if "Sales" in excel_data:
+                df = excel_data["Sales"]
+                if "caption" in df.columns:
+                    return df
+            
+            # Priority 2: Look for any sheet with 'caption' column
+            for sheet_name, df in excel_data.items():
+                if "caption" in df.columns:
+                    print(f"✅ Found 'caption' column in sheet: {sheet_name}")
+                    return df
+            
+            raise Exception("No sheet containing a 'caption' column was found.")
+            
+        except Exception as e:
+            print(f"⚠️ XLSX fetch failed, falling back to CSV: {e}")
+            csv_url = f"{base_url}/export?format=csv"
+            response = requests.get(csv_url)
+            response.raise_for_status()
+            df = pd.read_csv(io.StringIO(response.text))
+    else:
+        # Local file
+        if path.endswith(".xlsx") or path.endswith(".xls"):
+            df = pd.read_excel(path)
+        else:
+            df = pd.read_csv(path)
+
+    if "caption" not in df.columns:
+        raise Exception("Sheet must contain a column named 'caption'")
+
+    return df
 
 
-# Gemini client (lazy init)
-gemini_client = None
+async def monitor_caption_updates():
+    global last_row_count
+
+    await bot.wait_until_ready()
+    print("✅ Caption Monitoring Task Started (Waiting for Channel ID)...")
+
+    while True:
+        try:
+            if ANNOUNCEMENT_CHANNEL_ID == 0:
+                await asyncio.sleep(5)
+                continue
+
+            channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+            if not channel:
+                print(f"⚠️ Excel Monitor: Cannot find channel with ID {ANNOUNCEMENT_CHANNEL_ID}")
+                await asyncio.sleep(10)
+                continue
+
+            df = fetch_sheet_data()
+            if df is not None:
+                current_row_count = len(df)
+
+                # Initialize on first run
+                if last_row_count == 0:
+                    last_row_count = current_row_count
+                    print(f"✅ Initialized with {last_row_count} rows.")
+                
+                # Check for new rows
+                elif current_row_count > last_row_count:
+                    new_rows = df.iloc[last_row_count:]
+                    
+                    for index, row in new_rows.iterrows():
+                        new_caption = str(row["caption"]).strip()
+                        if new_caption and new_caption != "nan":
+                            print(f"📢 Announcing new caption from row {index + 1}")
+                            
+                            embed = discord.Embed(
+                                title="📢 New Data Added!",
+                                description=f"```{new_caption[:1900]}```",
+                                color=discord.Color.blue(),
+                                timestamp=datetime.now()
+                            )
+                            embed.set_footer(text=f"Row {index + 1}")
+                            
+                            await channel.send(embed=embed)
+                    
+                    last_row_count = current_row_count
+
+        except Exception as e:
+            print("Excel Caption Monitor Error:", e)
+
+        await asyncio.sleep(EXCEL_CHECK_INTERVAL)
+
 
 def get_gemini_client():
     global gemini_client
@@ -41,7 +151,44 @@ server_coordinates = {}  # {guild_id: {name: {lat, long, saved_by, timestamp}}}
 @bot.event
 async def on_ready():
     print(f"{bot.user} is online!")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Aitrik's server"))
+
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="Aitrik's server"
+        )
+    )
+
+    # ✅ Start Excel Caption Monitor (if not already started)
+    global monitor_started
+    if not monitor_started:
+        bot.loop.create_task(monitor_caption_updates())
+        monitor_started = True
+
+
+@bot.command(name="setannouncements", aliases=["setchannel", "announcechannel"])
+@commands.has_permissions(administrator=True)
+async def set_announcement_channel(ctx):
+    """
+    Set the current channel as the bot's announcement channel.
+    Excel updates will be posted here.
+    """
+
+    global ANNOUNCEMENT_CHANNEL_ID
+    ANNOUNCEMENT_CHANNEL_ID = ctx.channel.id
+
+    embed = discord.Embed(
+        title="✅ Announcement Channel Set!",
+        description=(
+            f"📢 All Excel caption updates will now be posted in:\n"
+            f"{ctx.channel.mention}"
+        ),
+        color=discord.Color.green()
+    )
+
+    embed.set_footer(text=f"Set by {ctx.author.display_name}")
+
+    await ctx.reply(embed=embed)
 
 
 # --- Help/Commands List ---
@@ -86,7 +233,7 @@ async def show_commands(ctx):
         "**!quote save** `<text>` - Save a quote\n"
         "**!quote random** - Show random saved quote\n"
         "**!quote list** - List all quotes\n"
-        "**!cords add** `<name> <x> <y> <z> [dimension]` - Save coordinates\n"
+        "**!cords add** `<name> <lati>,<longi>` - Save coordinates\n"
         "**!cords** `<name>` - Get specific coordinates\n"
         "**!cords list** - List all saved locations\n"
         "**!cords delete** `<name>` - Delete coordinates"
