@@ -1,0 +1,7 @@
+discord.py
+python-dotenv
+google-genai
+pandas
+openpyxl
+flask
+requests
